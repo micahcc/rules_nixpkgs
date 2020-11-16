@@ -558,8 +558,6 @@ toolchain(
         "@io_tweag_rules_nixpkgs//nixpkgs/constraints:support_nix",
     ],
     target_compatible_with = [
-        "@platforms//cpu:x86_64",
-        "@platforms//os:{os}",
     ],
 )
     """.format(
