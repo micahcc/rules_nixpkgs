@@ -48,7 +48,7 @@ let
           if pkgs.stdenv.isDarwin then
             [ (pkgs.overrideCC pkgs.stdenv darwinCC).cc pkgs.darwin.binutils ]
           else
-            [ pkgs.stdenv.cc pkgs.binutils ];
+            [ clangStdenv.cc pkgs.binutils ];
         pathsToLink = [ "/bin" ];
       }
   ;
@@ -68,7 +68,7 @@ in
       # Determine toolchain tool paths.
       #
       # If a tool is not available then we use `bin/false` as a stand-in.
-      declare -A TOOLS=( [ar]=ar [cpp]=cpp [dwp]=dwp [gcc]=cc [gcov]=gcov [ld]=ld [nm]=nm [objcopy]=objcopy [objdump]=objdump [strip]=strip )
+      declare -A TOOLS=( [ar]=ar [cpp]=cpp [dwp]=dwp [gcc]=c++ [gcov]=gcov [ld]=ld [nm]=nm [objcopy]=objcopy [objdump]=objdump [strip]=strip )
       TOOL_NAMES=(''${!TOOLS[@]})
       declare -A TOOL_PATHS=()
       for tool_name in ''${!TOOLS[@]}; do
