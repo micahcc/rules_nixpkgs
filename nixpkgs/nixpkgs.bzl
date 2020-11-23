@@ -146,7 +146,7 @@ def _nixpkgs_package_impl(repository_ctx):
     elif not repositories:
         fail(strFailureImplicitNixpkgs)
     else:
-        expr_args = ["-E", "import <nixpkgs> { config = {}; overlays = []; }"]
+        expr_args = ["-E", "import <nixpkgs>"]
 
     nix_file_deps = {}
     for dep in repository_ctx.attr.nix_file_deps:
@@ -222,6 +222,7 @@ def _nixpkgs_package_impl(repository_ctx):
             ),
             quiet = repository_ctx.attr.quiet,
             timeout = timeout,
+            environment = {"NIXPKGS_ALLOW_UNFREE": "1", "NIX_PROFILES": "/nix/var/nix/profiles/default"},
         )
         output_path = exec_result.stdout.splitlines()[-1]
 
@@ -420,6 +421,9 @@ def _parse_cc_toolchain_info(content, filename):
             "cc_toolchain_info",
         )
 
+    cxx_flags = info["CXX_FLAGS"]
+    for x in info["CXX_BUILTIN_INCLUDE_DIRECTORIES"]:
+        cxx_flags.extend(["-isystem", x])
     return struct(
         tool_paths = {
             tool: path
@@ -427,7 +431,7 @@ def _parse_cc_toolchain_info(content, filename):
         },
         cxx_builtin_include_directories = info["CXX_BUILTIN_INCLUDE_DIRECTORIES"],
         compile_flags = info["COMPILE_FLAGS"],
-        cxx_flags = info["CXX_FLAGS"],
+        cxx_flags = cxx_flags,
         link_flags = info["LINK_FLAGS"],
         link_libs = info["LINK_LIBS"],
         opt_compile_flags = info["OPT_COMPILE_FLAGS"],
@@ -853,7 +857,7 @@ def nixpkgs_cc_configure_deprecated(
     """
     if not nix_file and not nix_file_content:
         nix_file_content = """
-          with import <nixpkgs> { config = {}; overlays = []; }; buildEnv {
+          with import <nixpkgs>; buildEnv {
             name = "bazel-cc-toolchain";
             paths = [ stdenv.cc binutils ];
           }
@@ -916,7 +920,7 @@ _nixpkgs_python_toolchain = repository_rule(
 )
 
 _python_nix_file_content = """
-with import <nixpkgs> {{ config = {{}}; overlays = []; }};
+with import <nixpkgs>;
 runCommand "bazel-nixpkgs-python-toolchain"
   {{ executable = false;
     # Pointless to do this on a remote machine.
@@ -1020,7 +1024,7 @@ def nixpkgs_sh_posix_config(name, packages, **kwargs):
     nixpkgs_package(
         name = name,
         nix_file_content = """
-with import <nixpkgs> {{ config = {{}}; overlays = []; }};
+with import <nixpkgs>;
 
 let
   # `packages` might include lists, e.g. `stdenv.initialPath` is a list itself,
