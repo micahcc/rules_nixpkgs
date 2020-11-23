@@ -526,10 +526,6 @@ _nixpkgs_cc_toolchain = repository_rule(
 
 def nixpkgs_cc_configure(
         name = "local_config_cc",
-        attribute_path = "",
-        nix_file = None,
-        nix_file_content = "",
-        nix_file_deps = [],
         repositories = {},
         repository = None,
         nixopts = [],
@@ -554,10 +550,6 @@ def nixpkgs_cc_configure(
       toolchain.
 
     Attrs:
-      attribute_path: optional, string, Obtain the toolchain from the Nix expression under this attribute path. Requires `nix_file` or `nix_file_content`.
-      nix_file: optional, Label, Obtain the toolchain from the Nix expression defined in this file. Specify only one of `nix_file` or `nix_file_content`.
-      nix_file_content: optional, string, Obtain the toolchain from the given Nix expression. Specify only one of `nix_file` or `nix_file_content`.
-      nix_file_deps: optional, list of Label, Additional files that the Nix expression depends on.
       repositories: dict of Label to string, Provides `<nixpkgs>` and other repositories. Specify one of `repositories` or `repository`.
       repository: Label, Provides `<nixpkgs>`. Specify one of `repositories` or `repository`.
       nixopts: optional, list of string, Extra flags to pass when calling Nix. Subject to location expansion, any instance of `$(location LABEL)` will be replaced by the path to the file ferenced by `LABEL` relative to the workspace root.
@@ -565,54 +557,11 @@ def nixpkgs_cc_configure(
       fail_not_supported: bool, Whether to fail if `nix-build` is not available.
     """
 
-    nixopts = list(nixopts)
-    nix_file_deps = list(nix_file_deps)
-
-    nix_expr = None
-    if nix_file and nix_file_content:
-        fail("Cannot specify both 'nix_file' and 'nix_file_content'.")
-    elif nix_file:
-        nix_expr = "import $(location {})".format(nix_file)
-        nix_file_deps.append(nix_file)
-    elif nix_file_content:
-        nix_expr = nix_file_content
-
-    if attribute_path and nix_expr == None:
-        fail("'attribute_path' requires one of 'nix_file' or 'nix_file_content'", "attribute_path")
-    elif attribute_path:
-        nixopts.extend([
-            "--argstr",
-            "ccType",
-            "ccTypeAttribute",
-            "--argstr",
-            "ccAttrPath",
-            attribute_path,
-            "--arg",
-            "ccAttrSet",
-            nix_expr,
-        ])
-    elif nix_expr:
-        nixopts.extend([
-            "--argstr",
-            "ccType",
-            "ccTypeExpression",
-            "--arg",
-            "ccExpr",
-            nix_expr,
-        ])
-    else:
-        nixopts.extend([
-            "--argstr",
-            "ccType",
-            "ccTypeDefault",
-        ])
-
     # Invoke `toolchains/cc.nix` which generates `CC_TOOLCHAIN_INFO`.
     nixpkgs_package(
         name = "{}_info".format(name),
         nix_file = "@io_tweag_rules_nixpkgs//nixpkgs:toolchains/cc.nix",
-        nix_file_deps = nix_file_deps,
-        build_file_content = "exports_files(['CC_TOOLCHAIN_INFO'])",
+        build_file = "@io_tweag_rules_nixpkgs//nixpkgs:toolchains/cc.BUILD",
         repositories = repositories,
         repository = repository,
         nixopts = nixopts,
