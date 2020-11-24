@@ -329,6 +329,9 @@ def _parse_cc_toolchain_info(content, filename):
             "cc_toolchain_info",
         )
 
+    cxx_flags = info["CXX_FLAGS"]
+    for x in info["CXX_BUILTIN_INCLUDE_DIRECTORIES"]:
+        cxx_flags.extend(["-isystem", x])
     return struct(
         tool_paths = {
             tool: path
@@ -336,7 +339,7 @@ def _parse_cc_toolchain_info(content, filename):
         },
         cxx_builtin_include_directories = info["CXX_BUILTIN_INCLUDE_DIRECTORIES"],
         compile_flags = info["COMPILE_FLAGS"],
-        cxx_flags = info["CXX_FLAGS"],
+        cxx_flags = cxx_flags,
         link_flags = info["LINK_FLAGS"],
         link_libs = info["LINK_LIBS"],
         opt_compile_flags = info["OPT_COMPILE_FLAGS"],
