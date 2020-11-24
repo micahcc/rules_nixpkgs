@@ -48,8 +48,8 @@ let
           if pkgs.stdenv.isDarwin then
             [ (pkgs.overrideCC pkgs.stdenv darwinCC).cc pkgs.darwin.binutils ]
           else
-            [ clangStdenv.cc pkgs.binutils ];
-        pathsToLink = [ "/bin" ];
+            [ pkgs.clang pkgs.gcc.cc.lib pkgs.binutils ];
+        pathsToLink = [ "/bin" "/lib" "/include" ];
       }
   ;
 in
@@ -170,7 +170,7 @@ in
         ${
           if pkgs.stdenv.isDarwin
           then "-undefined dynamic_lookup -headerpad_max_install_names"
-          else "-B${cc}/bin"
+          else "-B${cc}/bin -L${cc}/lib"
         }
         $(
           # Have gcc return the exit code from ld.
