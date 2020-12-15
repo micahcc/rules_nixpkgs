@@ -183,11 +183,23 @@ def filter_empty(lst):
             out.append(f)
     return out
 
-def read_build_inputs(stringList):
-    if stringList == None:
-        fail("Must provide a list of 'attr1=path1:attr2=path2:...")
+def read_build_inputs(repository_ctx):
+    ldflags = repository_ctx.os.environ.get("NIX_LDFLAGS")
+    cc = repository_ctx.os.environ.get("NIX_CC")
+    cflags = repository_ctx.os.environ.get("NIX_CFLAGS_COMPILE")
+    if ldflags == None and cc == None and cflags == None:
+        return None
 
+    print("In nix environment, reading bazelBuildInputs for 'attr=path:...' mappings")
+    stringList = repository_ctx.os.environ.get("bazelBuildInputs")
+    if stringList == None or len(stringList) == 0:
+        fail("Must provide a list of 'attr1=path1:attr2=path2:..., but list was empty")
+
+    print("Found '{}'", stringList)
     stringList = stringList.strip()
+    if len(stringList) == 0:
+        fail("Must provide mapping from attrs to paths in When splitting {} by =, expected two values, but found {}".format(s, len(spl)))
+
     output = {}
     attrMapStrings = stringList.split(":")
     for s in attrMapStrings:
@@ -294,7 +306,7 @@ def _build_nixpkg(repository_ctx):
     exec_result = _execute_or_fail(
         repository_ctx,
         nix_build,
-        failure_message = "Cannot build Nix attribute '{}'.".format(
+        failure_message = "Cannot build Nix attributes {}.".format(
             repository_ctx.attr.attribute_paths,
         ),
         quiet = repository_ctx.attr.quiet,
@@ -339,7 +351,7 @@ def _match_inputs_to_attributes(buildInputs, attr_map):
     return outputs
 
 def _nixpkgs_package_impl(repository_ctx):
-    bazelBuildInputs = read_build_inputs(repository_ctx.os.environ.get("bazelBuildInputs"))
+    bazelBuildInputs = read_build_inputs(repository_ctx)
 
     # If true, a BUILD file will be created from a template if it does not
     # exits.
