@@ -187,7 +187,7 @@ def read_build_inputs(stringList):
     if stringList == None:
         fail("Must provide a list of 'attr1=path1:attr2=path2:...")
 
-    stringList = stringList.str()
+    stringList = stringList.strip()
     output = {}
     attrMapStrings = stringList.split(":")
     for s in attrMapStrings:
