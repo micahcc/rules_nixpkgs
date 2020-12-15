@@ -50,9 +50,9 @@ def _get_include_dirs(repository_ctx, compiler):
             gatheringSys = False
             gatheringInc = False
         elif gatheringInc:
-            out.append(" -I{}".format(line))
+            out.append(line.strip())
         elif gatheringSys:
-            out.append(" -isystem {}".format(line))
+            out.append(line.strip())
 
     return out
 
@@ -62,6 +62,7 @@ def _is_linker_option_supported(repository_ctx, compiler, option):
         option,
         "-x",
         "c++",
+        "-Werror",
         "-o",
         "/dev/null",
         Label("@io_tweag_rules_nixpkgs//nixpkgs/toolchains:test.cc"),
@@ -75,6 +76,7 @@ def _is_compiler_option_supported(repository_ctx, compiler, option):
         "-c",
         "-x",
         "c++",
+        "-Werror",
         "-o",
         "/dev/null",
         Label("@io_tweag_rules_nixpkgs//nixpkgs/toolchains:test.cc"),
@@ -466,7 +468,111 @@ def _nixpkgs_cc_toolchain_config_impl(repository_ctx):
     cxx_builtin_include_directories = _get_include_dirs(repository_ctx, repository_ctx.attr.gcc)
 
     compile_flags = []
+    for flag in [
+        # Security hardening requires optimization.
+        # We need to undef it as some distributions now have it enabled by default.
+        "-U_FORTIFY_SOURCE",
+        "-fstack-protector",
+        # All warnings are enabled. Maybe enable -Werror as well?
+        "-Wall",
+        # Enable a few more warnings that aren't part of -Wall.
+        "-Wthread-safety",
+        "-Wself-assign",
+        # Disable problematic warnings.
+        "-Wunused-but-set-parameter",
+        # has false positives
+        "-Wno-free-nonheap-object",
+        # Enable coloring even if there's no attached terminal. Bazel removes the
+        # escape sequences if --nocolor is specified.
+        "-fcolor-diagnostics",
+        # Keep stack frames for debugging, even in opt mode.
+        "-fno-omit-frame-pointer",
+    ]:
+        if _is_compiler_option_supported(repository_ctx, repository_ctx.attr.gcc, flag):
+            compile_flags.append(flag)
+
+    cxx_flags = [
+        "-x c++",
+        "-std=c++0x",
+    ]
+
     link_flags = []
+    for flag in [
+        "-Wl,-no-as-needed",
+        "-no-as-needed",
+        "-Wl,-z,relro,-z,now",
+        "-z",
+
+        # Have gcc return the exit code from ld.
+        "-pass-exit-codes",
+    ]:
+        if _is_linker_option_supported(repository_ctx, repository_ctx.attr.gcc, flag):
+            link_flags.append(flag)
+
+    if darwin:
+        link_flags.extend([
+            "-undefined dynamic_lookup",
+            "-headerpad_max_install_names",
+        ])
+    else:
+        link_flags.extend(["-B${cc}/bin", "-L${cc}/lib"])
+
+    link_libs = [
+        "-lstdc++",
+        "-lm",
+    ]
+
+    opt_compile_flags = [
+        # No debug symbols.
+        # Maybe we should enable https://gcc.gnu.org/wiki/DebugFission for opt or
+        # even generally? However, that can't happen here, as it requires special
+        # handling in Bazel.
+        "-g0",
+
+        # Conservative choice for -O
+        # -O3 can increase binary size and even slow down the resulting binaries.
+        # Profile first and / or use FDO if you need better performance than this.
+        "-O2",
+
+        # Security hardening on by default.
+        # Conservative choice; -D_FORTIFY_SOURCE=2 may be unsafe in some cases.
+        "-D_FORTIFY_SOURCE=1",
+
+        # Disable assertions
+        "-DNDEBUG",
+
+        # Removal of unused code and data at link time (can this increase binary
+        # size in some cases?).
+        "-ffunction-sections",
+        "-fdata-sections",
+    ]
+
+    opt_link_flags = []
+    if not darwin:
+        opt_link_flags.extend(["-Wl,--gc-sections", "-gc-sections"])
+
+    unfiltered_compile_flags = [
+        "-fno-canonical-system-headers",
+        "-no-canonical-prefixes",
+        "-Wno-builtin-macro-redefined",
+        '-D__DATE__=\\\"redacted\\\"',
+        '-D__TIMESTAMP__=\\\"redacted\\\"',
+        '-D__TIME__=\\\"redacted\\\"',
+    ]
+
+    # Make C++ compilation deterministic. Use linkstamping instead of these
+    # compiler symbols.
+    dbg_compile_flags = ["-g"]
+
+    if darwin:
+        coverage_compile_flags = ["-fprofile-instr-generate", "-fcoverage-mapping"]
+    else:
+        coverage_compile_flags = ["--coverage"]
+
+    if darwin:
+        coverage_link_flags = ["-fprofile-instr-generate"]
+    else:
+        coverage_link_flags = ["--coverage"]
 
     supports_start_end_lib = False
     if repository_ctx.attr.ld.name.endswith("ld.gold"):
@@ -486,7 +592,6 @@ def _nixpkgs_cc_toolchain_config_impl(repository_ctx):
         "objdump": repository_ctx.attr.objdump,
         "strip": repository_ctx.attr.strip,
     }
-    cxx_builtin_include_directories = cxx_builtin_include_directories
     compile_flags = compile_flags
     cxx_flags = []
     link_libs = []
@@ -535,6 +640,7 @@ def _nixpkgs_cc_toolchain_config_impl(repository_ctx):
         tool_paths["gcc"],
         cxx_builtin_include_directories,
     )
+
     repository_ctx.template(
         "BUILD.bazel",
         repository_ctx.path(repository_ctx.attr._build),
@@ -556,7 +662,7 @@ def _nixpkgs_cc_toolchain_config_impl(repository_ctx):
             "%{target_cpu}": cpu_value,
             "%{target_system_name}": "local",
             "%{tool_paths}": ",\n        ".join(
-                ['"%s": "%s"' % (k, v) for (k, v) in tool_paths.items()],
+                ['"%s": "%s"' % (k, repository_ctx.path(v)) for (k, v) in tool_paths.items()],
             ),
             "%{cxx_builtin_include_directories}": get_starlark_list(cxx_builtin_include_directories),
             "%{compile_flags}": get_starlark_list(compile_flags),
@@ -729,8 +835,6 @@ def nixpkgs_cc_configure(
         is_clang = True,
         fail_not_supported = fail_not_supported,
     )
-
-    return
 
     # Generate the `cc_toolchain` workspace.
     _nixpkgs_cc_toolchain(
