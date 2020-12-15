@@ -195,6 +195,7 @@ def read_build_inputs(stringList):
         spl = s.split("=")
         if len(spl) != 2:
             fail("When splitting %s by =, expected two values, but found %i" % (s, len(spl)))
+        key, value = spl
         output[key.strip()] = value.strip()
     return output
 
