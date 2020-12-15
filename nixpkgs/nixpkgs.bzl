@@ -834,12 +834,12 @@ def nixpkgs_cc_configure(
     """
 
     nixopts = list(nixopts)
-    attribute_paths = {
+    attribute_paths = [
         "pkgs.clang",
         "pkgs.gcc.cc",
         "pkgs.gcc.cc.lib",
         "pkgs.binutils.bintools",
-    }
+    ]
 
     # Invoke `toolchains/cc.nix` which generates `CC_TOOLCHAIN_INFO`.
     nixpkgs_package(
