@@ -184,7 +184,7 @@ def filter_empty(lst):
     return out
 
 def read_build_inputs(stringList):
-    if stringList is None:
+    if stringList == None:
         fail("Must provide a list of 'attr1=path1:attr2=path2:...")
 
     output = {}
