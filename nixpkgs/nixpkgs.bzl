@@ -195,7 +195,7 @@ def read_build_inputs(repository_ctx):
     if stringList == None or len(stringList) == 0:
         fail("Must provide a list of 'attr1=path1:attr2=path2:..., but list was empty")
 
-    print("Found '{}'", stringList)
+    print("Found '{}'".format(stringList))
     stringList = stringList.strip()
     if len(stringList) == 0:
         fail("Must provide mapping from attrs to paths in When splitting {} by =, expected two values, but found {}".format(s, len(spl)))
@@ -204,6 +204,8 @@ def read_build_inputs(repository_ctx):
     attrMapStrings = stringList.split(":")
     for s in attrMapStrings:
         s = s.strip()
+        if s == "":
+            continue
         spl = s.split("=")
         if len(spl) != 2:
             fail("When splitting {} by =, expected two values, but found {}".format(s, len(spl)))
