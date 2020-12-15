@@ -175,67 +175,45 @@ Create an external repository representing the content of Nixpkgs, based on a Ni
 """,
 )
 
-def read_build_inputs(env):
-    buildInputs = env.get("buildInputs")
-    propagatedBuildInputs = env.get("propagatedBuildInputs")
-    nativeBuildInputs = env.get("nativeBuildInputs")
+def filter_empty(lst):
+    out = []
+    for f in lst:
+        f = f.strip()
+        if f != "":
+            out.append(f)
+    return out
 
-    if buildInputs == None and propagatedBuildInputs == None and nativeBuildInputs == None:
-        return None
+def read_build_inputs(stringList):
+    if stringList is None:
+        fail("Must provide a list of 'attr1=path1:attr2=path2:...")
 
-    if buildInputs != None:
-        buildInputs = buildInputs.split(" ")
-    else:
-        buildInputs = []
-
-    if propagatedBuildInputs != None:
-        propagatedBuildInputs = propagatedBuildInputs.split(" ")
-    else:
-        propagatedBuildInputs = []
-
-    if nativeBuildInputs != None:
-        nativeBuildInputs = nativeBuildInputs.split(" ")
-    else:
-        nativeBuildInputs = []
-
-    return buildInputs + propagatedBuildInputs + nativeBuildInputs
+    output = {}
+    attrMapStrings = stringList.split(":")
+    for s in attrMapStrings:
+        key, value = s.split("=")
+        output[key] = value
+    return output
 
 def _is_supported_platform(repository_ctx):
     return repository_ctx.which("nix-build") != None
 
-def _nixpkgs_package_impl(repository_ctx):
-    buildInputs = read_build_inputs(repository_ctx.os.environ)
-    if buildInputs != None:
-        print("Overriding")
-        print(buildInputs)
-
+def _build_nixpkg(repository_ctx):
     repository = repository_ctx.attr.repository
     repositories = repository_ctx.attr.repositories
-
-    # Is nix supported on this platform?
-    not_supported = not _is_supported_platform(repository_ctx)
-
-    # Should we fail if Nix is not supported?
-    fail_not_supported = repository_ctx.attr.fail_not_supported
 
     if repository and repositories or not repository and not repositories:
         fail("Specify one of 'repository' or 'repositories' (but not both).")
     elif repository:
         repositories = {repository_ctx.attr.repository: "nixpkgs"}
 
-    # If true, a BUILD file will be created from a template if it does not
-    # exits.
-    # However this will happen AFTER the nix-build command.
-    create_build_file_if_needed = False
-    if repository_ctx.attr.build_file and repository_ctx.attr.build_file_content:
-        fail("Specify one of 'build_file' or 'build_file_content', but not both.")
-    elif repository_ctx.attr.build_file:
-        repository_ctx.symlink(repository_ctx.attr.build_file, "BUILD")
-    elif repository_ctx.attr.build_file_content:
-        repository_ctx.file("BUILD", content = repository_ctx.attr.build_file_content)
-    else:
-        # No user supplied build file, we may create the default one.
-        create_build_file_if_needed = True
+    # Is nix supported on this platform?
+    not_supported = not _is_supported_platform(repository_ctx)
+
+    # Should we fail if Nix is not supported?
+    if not_supported and repository_ctx.attr.fail_not_supported:
+        fail("Platform is not supported: nix-build not found in PATH. See attribute fail_not_supported if you don't want to use Nix.")
+    elif not_supported:
+        return []
 
     strFailureImplicitNixpkgs = (
         "One of 'repositories', 'nix_file' or 'nix_file_content' must be provided. " +
@@ -248,7 +226,7 @@ def _nixpkgs_package_impl(repository_ctx):
     else:
         expr_args = ["-E", "import <nixpkgs>"]
 
-    for attribute_path in repository_ctx.attr.attribute_paths:
+    for _, attribute_path in repository_ctx.attr.attribute_paths.items():
         expr_args.extend([
             "-A",
             attribute_path,
@@ -295,64 +273,122 @@ def _nixpkgs_package_impl(repository_ctx):
     for dir in nix_path:
         expr_args.extend(["-I", dir])
 
-    if not_supported and fail_not_supported:
-        fail("Platform is not supported: nix-build not found in PATH. See attribute fail_not_supported if you don't want to use Nix.")
-    elif not_supported:
-        return
+    nix_build_path = _executable_path(
+        repository_ctx,
+        "nix-build",
+        extra_msg = "See: https://nixos.org/nix/",
+    )
+    nix_build = [nix_build_path] + expr_args
+
+    # Large enough integer that Bazel can still parse. We don't have
+    # access to MAX_INT and 0 is not a valid timeout so this is as good
+    # as we can do. The value shouldn't be too large to avoid errors on
+    # macOS, see https://github.com/tweag/rules_nixpkgs/issues/92.
+    timeout = 8640000
+    repository_ctx.report_progress("Building Nix derivation")
+    exec_result = _execute_or_fail(
+        repository_ctx,
+        nix_build,
+        failure_message = "Cannot build Nix attribute '{}'.".format(
+            repository_ctx.attr.attribute_paths,
+        ),
+        quiet = repository_ctx.attr.quiet,
+        timeout = timeout,
+        environment = {"NIXPKGS_ALLOW_UNFREE": "1", "NIX_PROFILES": "/nix/var/nix/profiles/default"},
+    )
+    return exec_result.stdout.splitlines()
+
+def match_count(leftList, rightList):
+    # match in order
+    if len(leftList) == 0 or len(rightList) == 0:
+        return 0
+
+    a = int(leftList[0] == rightList[0]) + match_count(leftList[1:], rightList[1:])
+    b = match_count(leftList[1:], rightList)
+    c = match_count(leftList, rightList[1:])
+    return max(max(a, b), c)
+
+def _match_inputs_to_attributes(buildInputs, attr_map):
+    name_with_paths = []
+    for path in buildInputs:
+        # should be one of:
+        # /nix/store/z4zqsz220zsrfdrllmxs2zapnmzp12g6-<name>-<version>-<suffix>
+        # /nix/store/z4zqsz220zsrfdrllmxs2zapnmzp12g6-<name>-<version>
+        if not path.startswith("/nix/store/") or len(path) < 44:
+            fail("Unknown path type: %s" % path)
+        name_with_paths.append((path[44:], path))
+
+    outputs = []
+    for attr_name, attr_path in attr_map.items():
+        found = False
+        for name, path in name_with_paths:
+            if attr_name == name:
+                found = True
+                outputs.append(path)
+                break
+        if not found:
+            fail("No build input found to match attribute: {}".format(attr_name))
+
+    if len(outputs) != len(attr_map):
+        fail("Unknown failure while matching attributes")
+    return outputs
+
+def _nixpkgs_package_impl(repository_ctx):
+    bazelBuildInputs = read_build_inputs(repository_ctx.os.environ.get("bazelBuildInputs"))
+
+    # If true, a BUILD file will be created from a template if it does not
+    # exits.
+    # However this will happen AFTER the nix-build command.
+    create_build_file_if_needed = False
+    if repository_ctx.attr.build_file and repository_ctx.attr.build_file_content:
+        fail("Specify one of 'build_file' or 'build_file_content', but not both.")
+    elif repository_ctx.attr.build_file:
+        repository_ctx.symlink(repository_ctx.attr.build_file, "BUILD")
+    elif repository_ctx.attr.build_file_content:
+        repository_ctx.file("BUILD", content = repository_ctx.attr.build_file_content)
     else:
-        nix_build_path = _executable_path(
-            repository_ctx,
-            "nix-build",
-            extra_msg = "See: https://nixos.org/nix/",
-        )
-        nix_build = [nix_build_path] + expr_args
+        # No user supplied build file, we may create the default one.
+        create_build_file_if_needed = True
 
-        # Large enough integer that Bazel can still parse. We don't have
-        # access to MAX_INT and 0 is not a valid timeout so this is as good
-        # as we can do. The value shouldn't be too large to avoid errors on
-        # macOS, see https://github.com/tweag/rules_nixpkgs/issues/92.
-        timeout = 8640000
-        repository_ctx.report_progress("Building Nix derivation")
-        exec_result = _execute_or_fail(
+    if bazelBuildInputs == None:
+        # we're outside nix so we should be able to build the packages directly
+        output_paths = _build_nixpkg(repository_ctx)
+    else:
+        # we're inside nix, remap
+        output_paths = []
+        for attr in repository_ctx.attr.attribute_paths:
+            if attr not in bazelBuildInputs:
+                fail("Attr %s not passed to bazelBuildInputs, value: '%s', should be of the form attr1=value1:attr2=value2...")
+            output_paths.append(bazelBuildInputs[attr])
+
+    # ensure that the output is a directory
+    test_path = repository_ctx.which("test")
+    for output_path in output_paths:
+        _execute_or_fail(
             repository_ctx,
-            nix_build,
-            failure_message = "Cannot build Nix attribute '{}'.".format(
-                repository_ctx.attr.attribute_paths,
+            [test_path, "-d", output_path],
+            failure_message = "nixpkgs_package '@{}' outputs a single file which is not supported by rules_nixpkgs. Please only use directories.".format(
+                repository_ctx.name,
             ),
-            quiet = repository_ctx.attr.quiet,
-            timeout = timeout,
-            environment = {"NIXPKGS_ALLOW_UNFREE": "1", "NIX_PROFILES": "/nix/var/nix/profiles/default"},
         )
-        output_paths = exec_result.stdout.splitlines()
 
-        # ensure that the output is a directory
-        test_path = repository_ctx.which("test")
-        for output_path in output_paths:
-            _execute_or_fail(
-                repository_ctx,
-                [test_path, "-d", output_path],
-                failure_message = "nixpkgs_package '@{}' outputs a single file which is not supported by rules_nixpkgs. Please only use directories.".format(
-                    repository_ctx.name,
-                ),
-            )
+    # Build a forest of symlinks (like new_local_package() does) to the
+    # Nix store.
+    for attribute_path, output_path in zip(repository_ctx.attr.attribute_paths, output_paths):
+        repository_ctx.symlink(output_path, attribute_path)
 
-        # Build a forest of symlinks (like new_local_package() does) to the
-        # Nix store.
-        for attribute_path, output_path in zip(repository_ctx.attr.attribute_paths, output_paths):
-            repository_ctx.symlink(output_path, attribute_path)
-
-        # Create a default BUILD file only if it does not exists and is not
-        # provided by `build_file` or `build_file_content`.
-        if create_build_file_if_needed:
-            p = repository_ctx.path("BUILD")
-            if not p.exists:
-                repository_ctx.template("BUILD", Label("@io_tweag_rules_nixpkgs//nixpkgs:BUILD.pkg"))
+    # Create a default BUILD file only if it does not exists and is not
+    # provided by `build_file` or `build_file_content`.
+    if create_build_file_if_needed:
+        p = repository_ctx.path("BUILD")
+        if not p.exists:
+            repository_ctx.template("BUILD", Label("@io_tweag_rules_nixpkgs//nixpkgs:BUILD.pkg"))
 
 _nixpkgs_package = repository_rule(
     implementation = _nixpkgs_package_impl,
     environ = ["buildInputs", "nativeBuildInputs", "propagatedBuildInputs"],
     attrs = {
-        "attribute_paths": attr.string_list(),
+        "attribute_paths": attr.string_dict(),  # maps from name to attribute
         "repositories": attr.label_keyed_string_dict(),
         "repository": attr.label(),
         "build_file": attr.label(),
@@ -382,9 +418,7 @@ def nixpkgs_package(
 
     Args:
       name: A unique name for this repository.
-      attribute_path: Select an attribute from the top-level Nix expression being evaluated. The attribute path is a sequence of attribute names separated by dots.
-      nix_file: A file containing an expression for a Nix derivation.
-      nix_file_deps: Dependencies of `nix_file` if any.
+      attribute_paths: List of attributes to build and symlink in the build directory
       nix_file_content: An expression for a Nix derivation.
       repository: A repository label identifying which Nixpkgs to use. Equivalent to `repositories = { "nixpkgs": ...}`
       repositories: A dictionary mapping `NIX_PATH` entries to repository labels.
@@ -800,12 +834,12 @@ def nixpkgs_cc_configure(
     """
 
     nixopts = list(nixopts)
-    attribute_paths = [
+    attribute_paths = {
         "pkgs.clang",
         "pkgs.gcc.cc",
         "pkgs.gcc.cc.lib",
         "pkgs.binutils.bintools",
-    ]
+    }
 
     # Invoke `toolchains/cc.nix` which generates `CC_TOOLCHAIN_INFO`.
     nixpkgs_package(
