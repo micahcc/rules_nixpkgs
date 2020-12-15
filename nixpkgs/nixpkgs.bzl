@@ -12,7 +12,79 @@ load(
 load("@bazel_tools//tools/build_defs/repo:utils.bzl", "maybe")
 load(":private/location_expansion.bzl", "expand_location")
 
+NIX_ENVVARS = [
+    "NIX_CC",
+    "NIX_CLFAGS_COMPILE",
+    "NIX_CXXSTDLIB_COMPILE",
+    "NIX_BINTOOLS",
+]
+
+def in_nix_environment(env):
+    for key in NIX_ENVVARS:
+        if key not in env:
+            return False
+    return True
+
+def _get_include_dirs(repository_ctx, compiler):
+    result = _execute_or_fail(repository_ctx, [
+        compiler,
+        "-E",
+        "-x",
+        "c++",
+        "-",
+        "-v",
+    ], failure_message = "Failed to get builtin includes")
+
+    gatheringInc = False
+    gatheringSys = False
+
+    out = []
+    for line in result.stderr.splitlines():
+        if line == '#include "..." search starts here:':
+            gatheringInc = True
+            gatheringSys = False
+        elif line == "#include <...> search starts here:":
+            gatheringInc = False
+            gatheringSys = True
+        elif line == "End of search list.":
+            gatheringSys = False
+            gatheringInc = False
+        elif gatheringInc:
+            out.append(" -I{}".format(line))
+        elif gatheringSys:
+            out.append(" -isystem {}".format(line))
+
+    return out
+
+def _is_linker_option_supported(repository_ctx, compiler, option):
+    result = repository_ctx.execute([
+        compiler,
+        option,
+        "-x",
+        "c++",
+        "-o",
+        "/dev/null",
+        Label("@io_tweag_rules_nixpkgs//nixpkgs/toolchains:test.cc"),
+    ])
+    return result.return_code == 0
+
+def _is_compiler_option_supported(repository_ctx, compiler, option):
+    result = repository_ctx.execute([
+        compiler,
+        option,
+        "-c",
+        "-x",
+        "c++",
+        "-o",
+        "/dev/null",
+        Label("@io_tweag_rules_nixpkgs//nixpkgs/toolchains:test.cc"),
+    ])
+    return result.return_code == 0
+
 def _nixpkgs_git_repository_impl(repository_ctx):
+    if in_nix_environment(repository_ctx.os.environ):
+        print("Overriding")
+
     repository_ctx.file(
         "BUILD",
         content = 'filegroup(name = "srcs", srcs = glob(["**"]), visibility = ["//visibility:public"])',
@@ -47,6 +119,9 @@ Name a specific revision of Nixpkgs on GitHub or a local checkout.
 )
 
 def _nixpkgs_local_repository_impl(repository_ctx):
+    if in_nix_environment(repository_ctx.os.environ):
+        print("Overriding")
+
     if not bool(repository_ctx.attr.nix_file) != \
        bool(repository_ctx.attr.nix_file_content):
         fail("Specify one of 'nix_file' or 'nix_file_content' (but not both).")
@@ -98,10 +173,40 @@ Create an external repository representing the content of Nixpkgs, based on a Ni
 """,
 )
 
+def read_build_inputs(env):
+    buildInputs = env.get("buildInputs")
+    propagatedBuildInputs = env.get("propagatedBuildInputs")
+    nativeBuildInputs = env.get("nativeBuildInputs")
+
+    if buildInputs == None and propagatedBuildInputs == None and nativeBuildInputs == None:
+        return None
+
+    if buildInputs != None:
+        buildInputs = buildInputs.split(" ")
+    else:
+        buildInputs = []
+
+    if propagatedBuildInputs != None:
+        propagatedBuildInputs = propagatedBuildInputs.split(" ")
+    else:
+        propagatedBuildInputs = []
+
+    if nativeBuildInputs != None:
+        nativeBuildInputs = nativeBuildInputs.split(" ")
+    else:
+        nativeBuildInputs = []
+
+    return buildInputs + propagatedBuildInputs + nativeBuildInputs
+
 def _is_supported_platform(repository_ctx):
     return repository_ctx.which("nix-build") != None
 
 def _nixpkgs_package_impl(repository_ctx):
+    buildInputs = read_build_inputs(repository_ctx.os.environ)
+    if buildInputs != None:
+        print("Overriding")
+        print(buildInputs)
+
     repository = repository_ctx.attr.repository
     repositories = repository_ctx.attr.repositories
 
@@ -136,25 +241,17 @@ def _nixpkgs_package_impl(repository_ctx):
     )
 
     expr_args = []
-    if repository_ctx.attr.nix_file and repository_ctx.attr.nix_file_content:
-        fail("Specify one of 'nix_file' or 'nix_file_content', but not both.")
-    elif repository_ctx.attr.nix_file:
-        nix_file = _cp(repository_ctx, repository_ctx.attr.nix_file)
-        expr_args = [repository_ctx.path(nix_file)]
-    elif repository_ctx.attr.nix_file_content:
-        expr_args = ["-E", repository_ctx.attr.nix_file_content]
-    elif not repositories:
+    if not repositories:
         fail(strFailureImplicitNixpkgs)
     else:
         expr_args = ["-E", "import <nixpkgs>"]
 
-    nix_file_deps = {}
-    for dep in repository_ctx.attr.nix_file_deps:
-        nix_file_deps[dep] = _cp(repository_ctx, dep)
-
+    for attribute_path in repository_ctx.attr.attribute_paths:
+        expr_args.extend([
+            "-A",
+            attribute_path,
+        ])
     expr_args.extend([
-        "-A",
-        repository_ctx.attr.attribute_path if repository_ctx.attr.nix_file or repository_ctx.attr.nix_file_content else repository_ctx.attr.attribute_path or repository_ctx.attr.name,
         # Creating an out link prevents nix from garbage collecting the store path.
         # nixpkgs uses `nix-support/` for such house-keeping files, so we mirror them
         # and use `bazel-support/`, under the assumption that no nix package has
@@ -162,14 +259,14 @@ def _nixpkgs_package_impl(repository_ctx):
         # A `bazel clean` deletes the symlink and thus nix is free to garbage collect
         # the store path.
         "--out-link",
-        "bazel-support/nix-out-link",
+        "bazel-support/{}".format(repository_ctx.name),
     ])
 
     expr_args.extend([
         expand_location(
             repository_ctx = repository_ctx,
             string = opt,
-            labels = nix_file_deps,
+            labels = None,
             attr = "nixopts",
         )
         for opt in repository_ctx.attr.nixopts
@@ -190,7 +287,7 @@ def _nixpkgs_package_impl(repository_ctx):
         "{}={}".format(prefix, repository_ctx.path(repo))
         for (repo, prefix) in repositories.items()
     ]
-    if not (repositories or repository_ctx.attr.nix_file or repository_ctx.attr.nix_file_content):
+    if not repositories:
         fail(strFailureImplicitNixpkgs)
 
     for dir in nix_path:
@@ -218,29 +315,29 @@ def _nixpkgs_package_impl(repository_ctx):
             repository_ctx,
             nix_build,
             failure_message = "Cannot build Nix attribute '{}'.".format(
-                repository_ctx.attr.attribute_path,
+                repository_ctx.attr.attribute_paths,
             ),
             quiet = repository_ctx.attr.quiet,
             timeout = timeout,
             environment = {"NIXPKGS_ALLOW_UNFREE": "1", "NIX_PROFILES": "/nix/var/nix/profiles/default"},
         )
-        output_path = exec_result.stdout.splitlines()[-1]
+        output_paths = exec_result.stdout.splitlines()
 
         # ensure that the output is a directory
         test_path = repository_ctx.which("test")
-        _execute_or_fail(
-            repository_ctx,
-            [test_path, "-d", output_path],
-            failure_message = "nixpkgs_package '@{}' outputs a single file which is not supported by rules_nixpkgs. Please only use directories.".format(
-                repository_ctx.name,
-            ),
-        )
+        for output_path in output_paths:
+            _execute_or_fail(
+                repository_ctx,
+                [test_path, "-d", output_path],
+                failure_message = "nixpkgs_package '@{}' outputs a single file which is not supported by rules_nixpkgs. Please only use directories.".format(
+                    repository_ctx.name,
+                ),
+            )
 
         # Build a forest of symlinks (like new_local_package() does) to the
         # Nix store.
-        for target in _find_children(repository_ctx, output_path):
-            basename = target.rpartition("/")[-1]
-            repository_ctx.symlink(target, basename)
+        for attribute_path, output_path in zip(repository_ctx.attr.attribute_paths, output_paths):
+            repository_ctx.symlink(output_path, attribute_path)
 
         # Create a default BUILD file only if it does not exists and is not
         # provided by `build_file` or `build_file_content`.
@@ -251,11 +348,9 @@ def _nixpkgs_package_impl(repository_ctx):
 
 _nixpkgs_package = repository_rule(
     implementation = _nixpkgs_package_impl,
+    environ = ["buildInputs", "nativeBuildInputs", "propagatedBuildInputs"],
     attrs = {
-        "attribute_path": attr.string(),
-        "nix_file": attr.label(allow_single_file = [".nix"]),
-        "nix_file_deps": attr.label_list(),
-        "nix_file_content": attr.string(),
+        "attribute_paths": attr.string_list(),
         "repositories": attr.label_keyed_string_dict(),
         "repository": attr.label(),
         "build_file": attr.label(),
@@ -270,10 +365,7 @@ _nixpkgs_package = repository_rule(
 
 def nixpkgs_package(
         name,
-        attribute_path = "",
-        nix_file = None,
-        nix_file_deps = [],
-        nix_file_content = "",
+        attribute_paths,
         repository = None,
         repositories = {},
         build_file = None,
@@ -333,10 +425,7 @@ def nixpkgs_package(
     """
     kwargs.update(
         name = name,
-        attribute_path = attribute_path,
-        nix_file = nix_file,
-        nix_file_deps = nix_file_deps,
-        nix_file_content = nix_file_content,
+        attribute_paths = attribute_paths,
         repository = repository,
         repositories = repositories,
         build_file = build_file,
@@ -357,104 +446,9 @@ def nixpkgs_package(
 
     _nixpkgs_package(**kwargs)
 
-def _parse_cc_toolchain_info(content, filename):
-    """Parses the `CC_TOOLCHAIN_INFO` file generated by Nix.
-
-    Attrs:
-      content: string, The content of the `CC_TOOLCHAIN_INFO` file.
-      filename: string, The path to the `CC_TOOLCHAIN_INFO` file, used for error reporting.
-
-    Returns:
-      struct, The substitutions for `@bazel_tools//tools/cpp:BUILD.tpl`.
-    """
-
-    # Parse the content of CC_TOOLCHAIN_INFO.
-    #
-    # Each line has the form
-    #
-    #   <key>:<value1>:<value2>:...
-    info = {}
-    for line in content.splitlines():
-        fields = line.split(":")
-        if len(fields) == 0:
-            fail(
-                "Malformed CC_TOOLCHAIN_INFO '{}': Empty line encountered.".format(filename),
-                "cc_toolchain_info",
-            )
-        info[fields[0]] = fields[1:]
-
-    # Validate the keys in CC_TOOLCHAIN_INFO.
-    expected_keys = sets.make([
-        "TOOL_NAMES",
-        "TOOL_PATHS",
-        "CXX_BUILTIN_INCLUDE_DIRECTORIES",
-        "COMPILE_FLAGS",
-        "CXX_FLAGS",
-        "LINK_FLAGS",
-        "LINK_LIBS",
-        "OPT_COMPILE_FLAGS",
-        "OPT_LINK_FLAGS",
-        "UNFILTERED_COMPILE_FLAGS",
-        "DBG_COMPILE_FLAGS",
-        "COVERAGE_COMPILE_FLAGS",
-        "COVERAGE_LINK_FLAGS",
-        "SUPPORTS_START_END_LIB",
-        "IS_CLANG",
-    ])
-    actual_keys = sets.make(info.keys())
-    missing_keys = sets.difference(expected_keys, actual_keys)
-    unexpected_keys = sets.difference(actual_keys, expected_keys)
-    if sets.length(missing_keys) > 0:
-        fail(
-            "Malformed CC_TOOLCHAIN_INFO '{}': Missing entries '{}'.".format(
-                filename,
-                "', '".join(sets.to_list(missing_keys)),
-            ),
-            "cc_toolchain_info",
-        )
-    if sets.length(unexpected_keys) > 0:
-        fail(
-            "Malformed CC_TOOLCHAIN_INFO '{}': Unexpected entries '{}'.".format(
-                filename,
-                "', '".join(sets.to_list(unexpected_keys)),
-            ),
-            "cc_toolchain_info",
-        )
-
-    cxx_flags = info["CXX_FLAGS"]
-    for x in info["CXX_BUILTIN_INCLUDE_DIRECTORIES"]:
-        cxx_flags.extend(["-isystem", x])
-    return struct(
-        tool_paths = {
-            tool: path
-            for (tool, path) in zip(info["TOOL_NAMES"], info["TOOL_PATHS"])
-        },
-        cxx_builtin_include_directories = info["CXX_BUILTIN_INCLUDE_DIRECTORIES"],
-        compile_flags = info["COMPILE_FLAGS"],
-        cxx_flags = cxx_flags,
-        link_flags = info["LINK_FLAGS"],
-        link_libs = info["LINK_LIBS"],
-        opt_compile_flags = info["OPT_COMPILE_FLAGS"],
-        opt_link_flags = info["OPT_LINK_FLAGS"],
-        unfiltered_compile_flags = info["UNFILTERED_COMPILE_FLAGS"],
-        dbg_compile_flags = info["DBG_COMPILE_FLAGS"],
-        coverage_compile_flags = info["COVERAGE_COMPILE_FLAGS"],
-        coverage_link_flags = info["COVERAGE_LINK_FLAGS"],
-        supports_start_end_lib = info["SUPPORTS_START_END_LIB"] == ["True"],
-        is_clang = info["IS_CLANG"] == ["True"],
-    )
-
 def _nixpkgs_cc_toolchain_config_impl(repository_ctx):
     cpu_value = get_cpu_value(repository_ctx)
     darwin = cpu_value == "darwin"
-
-    cc_toolchain_info_file = repository_ctx.path(repository_ctx.attr.cc_toolchain_info)
-    if not cc_toolchain_info_file.exists and not repository_ctx.attr.fail_not_supported:
-        return
-    info = _parse_cc_toolchain_info(
-        repository_ctx.read(cc_toolchain_info_file),
-        cc_toolchain_info_file,
-    )
 
     # Generate the cc_toolchain workspace following the example from
     # `@bazel_tools//tools/cpp:unix_cc_configure.bzl`.
@@ -469,9 +463,46 @@ def _nixpkgs_cc_toolchain_config_impl(repository_ctx):
         "armeabi_cc_toolchain_config.bzl",
     )
 
+    cxx_builtin_include_directories = _get_include_dirs(repository_ctx, repository_ctx.attr.gcc)
+
+    compile_flags = []
+    link_flags = []
+
+    supports_start_end_lib = False
+    if repository_ctx.attr.ld.name.endswith("ld.gold"):
+        link_flags.append("-fuse-ld=gold")
+        supports_start_end_lib = True
+
+    # TODO(micah) support ld.gold
+    tool_paths = {
+        "ar": repository_ctx.attr.ar,
+        "cpp": repository_ctx.attr.cpp,
+        "dwp": repository_ctx.attr.dwp,
+        "gcc": repository_ctx.attr.gcc,
+        "gcov": repository_ctx.attr.gcov,
+        "ld": repository_ctx.attr.ld,
+        "nm": repository_ctx.attr.nm,
+        "objcopy": repository_ctx.attr.objcopy,
+        "objdump": repository_ctx.attr.objdump,
+        "strip": repository_ctx.attr.strip,
+    }
+    cxx_builtin_include_directories = cxx_builtin_include_directories
+    compile_flags = compile_flags
+    cxx_flags = []
+    link_libs = []
+    opt_compile_flags = []
+    opt_link_flags = []
+    unfiltered_compile_flags = []
+    dbg_compile_flags = []
+    dbg_compile_flags = []
+    coverage_compile_flags = ["--coverage"]
+    coverage_link_flags = ["--coverage"]
+    supports_start_end_lib = supports_start_end_lib
+    is_clang = repository_ctx.attr.is_clang
+
     # A module map is required for clang starting from Bazel version 3.3.0.
     # https://github.com/bazelbuild/bazel/commit/8b9f74649512ee17ac52815468bf3d7e5e71c9fa
-    needs_module_map = info.is_clang and versions.is_at_least("3.3.0", versions.get())
+    needs_module_map = repository_ctx.attr.is_clang and versions.is_at_least("3.3.0", versions.get())
     if needs_module_map:
         generate_system_module_map = [
             repository_ctx.path(repository_ctx.attr._generate_system_module_map),
@@ -480,7 +511,7 @@ def _nixpkgs_cc_toolchain_config_impl(repository_ctx):
             "module.modulemap",
             _execute_or_fail(
                 repository_ctx,
-                generate_system_module_map + info.cxx_builtin_include_directories,
+                generate_system_module_map + cxx_builtin_include_directories,
                 "Failed to generate system module map.",
             ).stdout.strip(),
             executable = False,
@@ -492,17 +523,17 @@ def _nixpkgs_cc_toolchain_config_impl(repository_ctx):
         "cc_wrapper.sh",
         repository_ctx.path(cc_wrapper_src),
         {
-            "%{cc}": info.tool_paths["gcc"],
+            "%{cc}": tool_paths["gcc"].name,
             "%{env}": "",
         },
     )
     if darwin:
-        info.tool_paths["gcc"] = "cc_wrapper.sh"
-        info.tool_paths["ar"] = "/usr/bin/libtool"
+        tool_paths["gcc"] = "cc_wrapper.sh"
+        tool_paths["ar"] = "/usr/bin/libtool"
     write_builtin_include_directory_paths(
         repository_ctx,
-        info.tool_paths["gcc"],
-        info.cxx_builtin_include_directories,
+        tool_paths["gcc"],
+        cxx_builtin_include_directories,
     )
     repository_ctx.template(
         "BUILD.bazel",
@@ -525,28 +556,38 @@ def _nixpkgs_cc_toolchain_config_impl(repository_ctx):
             "%{target_cpu}": cpu_value,
             "%{target_system_name}": "local",
             "%{tool_paths}": ",\n        ".join(
-                ['"%s": "%s"' % (k, v) for (k, v) in info.tool_paths.items()],
+                ['"%s": "%s"' % (k, v) for (k, v) in tool_paths.items()],
             ),
-            "%{cxx_builtin_include_directories}": get_starlark_list(info.cxx_builtin_include_directories),
-            "%{compile_flags}": get_starlark_list(info.compile_flags),
-            "%{cxx_flags}": get_starlark_list(info.cxx_flags),
-            "%{link_flags}": get_starlark_list(info.link_flags),
-            "%{link_libs}": get_starlark_list(info.link_libs),
-            "%{opt_compile_flags}": get_starlark_list(info.opt_compile_flags),
-            "%{opt_link_flags}": get_starlark_list(info.opt_link_flags),
-            "%{unfiltered_compile_flags}": get_starlark_list(info.unfiltered_compile_flags),
-            "%{dbg_compile_flags}": get_starlark_list(info.dbg_compile_flags),
-            "%{coverage_compile_flags}": get_starlark_list(info.coverage_compile_flags),
-            "%{coverage_link_flags}": get_starlark_list(info.coverage_link_flags),
-            "%{supports_start_end_lib}": repr(info.supports_start_end_lib),
+            "%{cxx_builtin_include_directories}": get_starlark_list(cxx_builtin_include_directories),
+            "%{compile_flags}": get_starlark_list(compile_flags),
+            "%{cxx_flags}": get_starlark_list(cxx_flags),
+            "%{link_flags}": get_starlark_list(link_flags),
+            "%{link_libs}": get_starlark_list(link_libs),
+            "%{opt_compile_flags}": get_starlark_list(opt_compile_flags),
+            "%{opt_link_flags}": get_starlark_list(opt_link_flags),
+            "%{unfiltered_compile_flags}": get_starlark_list(unfiltered_compile_flags),
+            "%{dbg_compile_flags}": get_starlark_list(dbg_compile_flags),
+            "%{coverage_compile_flags}": get_starlark_list(coverage_compile_flags),
+            "%{coverage_link_flags}": get_starlark_list(coverage_link_flags),
+            "%{supports_start_end_lib}": repr(supports_start_end_lib),
         },
     )
 
 _nixpkgs_cc_toolchain_config = repository_rule(
     _nixpkgs_cc_toolchain_config_impl,
     attrs = {
-        "cc_toolchain_info": attr.label(),
         "fail_not_supported": attr.bool(),
+        "ar": attr.label(mandatory = True),
+        "cpp": attr.label(mandatory = True),
+        "dwp": attr.label(),
+        "gcc": attr.label(mandatory = True),
+        "gcov": attr.label(mandatory = True),
+        "ld": attr.label(mandatory = True),
+        "nm": attr.label(mandatory = True),
+        "objcopy": attr.label(mandatory = True),
+        "objdump": attr.label(mandatory = True),
+        "strip": attr.label(),
+        "is_clang": attr.bool(default = False),
         "_unix_cc_toolchain_config": attr.label(
             default = Label("@bazel_tools//tools/cpp:unix_cc_toolchain_config.bzl"),
         ),
@@ -620,11 +661,7 @@ _nixpkgs_cc_toolchain = repository_rule(
 )
 
 def nixpkgs_cc_configure(
-        name = "local_config_cc",
-        attribute_path = "",
-        nix_file = None,
-        nix_file_content = "",
-        nix_file_deps = [],
+        name,
         repositories = {},
         repository = None,
         nixopts = [],
@@ -649,10 +686,6 @@ def nixpkgs_cc_configure(
     this toolchain.
 
     Args:
-      attribute_path: optional, string, Obtain the toolchain from the Nix expression under this attribute path. Requires `nix_file` or `nix_file_content`.
-      nix_file: optional, Label, Obtain the toolchain from the Nix expression defined in this file. Specify only one of `nix_file` or `nix_file_content`.
-      nix_file_content: optional, string, Obtain the toolchain from the given Nix expression. Specify only one of `nix_file` or `nix_file_content`.
-      nix_file_deps: optional, list of Label, Additional files that the Nix expression depends on.
       repositories: dict of Label to string, Provides `<nixpkgs>` and other repositories. Specify one of `repositories` or `repository`.
       repository: Label, Provides `<nixpkgs>`. Specify one of `repositories` or `repository`.
       nixopts: optional, list of string, Extra flags to pass when calling Nix. Subject to location expansion, any instance of `$(location LABEL)` will be replaced by the path to the file ferenced by `LABEL` relative to the workspace root.
@@ -661,55 +694,20 @@ def nixpkgs_cc_configure(
     """
 
     nixopts = list(nixopts)
-    nix_file_deps = list(nix_file_deps)
-
-    nix_expr = None
-    if nix_file and nix_file_content:
-        fail("Cannot specify both 'nix_file' and 'nix_file_content'.")
-    elif nix_file:
-        nix_expr = "import $(location {})".format(nix_file)
-        nix_file_deps.append(nix_file)
-    elif nix_file_content:
-        nix_expr = nix_file_content
-
-    if attribute_path and nix_expr == None:
-        fail("'attribute_path' requires one of 'nix_file' or 'nix_file_content'", "attribute_path")
-    elif attribute_path:
-        nixopts.extend([
-            "--argstr",
-            "ccType",
-            "ccTypeAttribute",
-            "--argstr",
-            "ccAttrPath",
-            attribute_path,
-            "--arg",
-            "ccAttrSet",
-            nix_expr,
-        ])
-    elif nix_expr:
-        nixopts.extend([
-            "--argstr",
-            "ccType",
-            "ccTypeExpression",
-            "--arg",
-            "ccExpr",
-            nix_expr,
-        ])
-    else:
-        nixopts.extend([
-            "--argstr",
-            "ccType",
-            "ccTypeDefault",
-        ])
+    attribute_paths = [
+        "pkgs.clang",
+        "pkgs.gcc.cc",
+        "pkgs.gcc.cc.lib",
+        "pkgs.binutils.bintools",
+    ]
 
     # Invoke `toolchains/cc.nix` which generates `CC_TOOLCHAIN_INFO`.
     nixpkgs_package(
-        name = "{}_info".format(name),
-        nix_file = "@io_tweag_rules_nixpkgs//nixpkgs:toolchains/cc.nix",
-        nix_file_deps = nix_file_deps,
-        build_file_content = "exports_files(['CC_TOOLCHAIN_INFO'])",
+        name = "{}_pkg".format(name),
+        build_file = "@io_tweag_rules_nixpkgs//nixpkgs/toolchains:cc.BUILD",
         repositories = repositories,
         repository = repository,
+        attribute_paths = attribute_paths,
         nixopts = nixopts,
         quiet = quiet,
         fail_not_supported = fail_not_supported,
@@ -718,9 +716,21 @@ def nixpkgs_cc_configure(
     # Generate the `cc_toolchain_config` workspace.
     _nixpkgs_cc_toolchain_config(
         name = "{}".format(name),
-        cc_toolchain_info = "@{}_info//:CC_TOOLCHAIN_INFO".format(name),
+        ar = "@{}_pkg//:pkgs.binutils.bintools/bin/ar".format(name),
+        cpp = "@{}_pkg//:pkgs.clang/bin/cpp".format(name),
+        dwp = "@{}_pkg//:pkgs.binutils.bintools/bin/dwp".format(name),
+        gcc = "@{}_pkg//:pkgs.clang/bin/c++".format(name),
+        gcov = "@{}_pkg//:pkgs.gcc.cc/bin/gcov".format(name),
+        ld = "@{}_pkg//:pkgs.binutils.bintools/bin/ld".format(name),
+        nm = "@{}_pkg//:pkgs.binutils.bintools/bin/nm".format(name),
+        objdump = "@{}_pkg//:pkgs.binutils.bintools/bin/objdump".format(name),
+        objcopy = "@{}_pkg//:pkgs.binutils.bintools/bin/objcopy".format(name),
+        strip = "@{}_pkg//:pkgs.binutils.bintools/bin/strip".format(name),
+        is_clang = True,
         fail_not_supported = fail_not_supported,
     )
+
+    return
 
     # Generate the `cc_toolchain` workspace.
     _nixpkgs_cc_toolchain(
@@ -859,16 +869,17 @@ def nixpkgs_cc_configure_deprecated(
         nix_file_content = """
           with import <nixpkgs>; buildEnv {
             name = "bazel-cc-toolchain";
-            paths = [ stdenv.cc binutils ];
+            paths = [  ];
           }
         """
     nixpkgs_package(
         name = "nixpkgs_cc_toolchain",
         repository = repository,
         repositories = repositories,
-        nix_file = nix_file,
-        nix_file_deps = nix_file_deps,
-        nix_file_content = nix_file_content,
+        attribute_paths = [
+            "stdenv.cc",
+            "binutils",
+        ],
         build_file_content = """exports_files(glob(["bin/*"]))""",
         nixopts = nixopts,
     )
