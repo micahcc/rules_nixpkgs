@@ -388,7 +388,7 @@ _nixpkgs_package = repository_rule(
     implementation = _nixpkgs_package_impl,
     environ = ["buildInputs", "nativeBuildInputs", "propagatedBuildInputs"],
     attrs = {
-        "attribute_paths": attr.string_dict(),  # maps from name to attribute
+        "attribute_paths": attr.string_list(),  # name of packages to build e.g. pkgs.boost
         "repositories": attr.label_keyed_string_dict(),
         "repository": attr.label(),
         "build_file": attr.label(),
