@@ -187,11 +187,15 @@ def read_build_inputs(stringList):
     if stringList == None:
         fail("Must provide a list of 'attr1=path1:attr2=path2:...")
 
+    stringList = stringList.str()
     output = {}
     attrMapStrings = stringList.split(":")
     for s in attrMapStrings:
-        key, value = s.split("=")
-        output[key] = value
+        s = s.strip()
+        spl = s.split("=")
+        if len(spl) != 2:
+            fail("When splitting %s by =, expected two values, but found %i" % (s, len(spl)))
+        output[key.strip()] = value.strip()
     return output
 
 def _is_supported_platform(repository_ctx):
