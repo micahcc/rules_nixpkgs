@@ -1,6 +1,5 @@
 """Rules for importing Nixpkgs packages."""
 
-load("@bazel_tools//tools/build_defs/repo:git_worker.bzl", "git_repo")
 load("@bazel_tools//tools/build_defs/repo:utils.bzl", "workspace_and_buildfile")
 load("@bazel_skylib//lib:sets.bzl", "sets")
 load("@bazel_skylib//lib:versions.bzl", "versions")
@@ -13,6 +12,7 @@ load(
 )
 load("@bazel_tools//tools/build_defs/repo:utils.bzl", "maybe")
 load(":private/location_expansion.bzl", "expand_location")
+load("//nixpkgs:git.bzl", "git_repo")
 
 NIX_FLAGS = [
     "NIX_LDFLAGS",
@@ -663,14 +663,62 @@ _nixpkgs_cc_toolchain_config = repository_rule(
     },
 )
 
+def _loadNixStructFile(ctx, fname):
+    # TODO(micah) make this actually robust, either find a json parser or just
+    # make this more robust
+    data = ctx.read(fname)
+    data = data.replace("\n", "")
+    data = data.replace("\r", "")
+    data = data.replace("\n", "")
+    data = data.replace(" ", "")
+    if data[0] != "{" or data[-1] != "}":
+        fail("Malformed nix struct: {}".format(data))
+
+    remapped = {}
+    data = data[1:-1]
+    for line in data.split(";"):
+        if line == "":
+            continue
+        if "=" not in line:
+            fail('nix struct should be of the form a = "b";')
+        key, value = line.split("=")
+        if value[0] != '"' or value[-1] != '"':
+            fail("Expected value to be quoted string, error parsing value:\n{}", value)
+        value = value[1:-1]
+        remapped[key] = value
+
+    return remapped
+
 def _nixpkgs_git_repository_impl(ctx):
     if _inside_nix(ctx):
         ctx.file("BUILD", executable = False)
         ctx.file("WORKSPACE", executable = False)
     else:
+        if ctx.attr.fetchGitFile != None:
+            data = _loadNixStructFile(ctx, ctx.attr.fetchGitFile)
+            commit = data.get("rev")
+            remote = data.get("url")
+            branch = data.get("ref")
+        else:
+            commit = ctx.attr.commit
+            remote = ctx.attr.remote
+            branch = ctx.attr.branch
+
         root = ctx.path(".")
         directory = str(root)
-        git_repo(ctx, directory)
+        git_repo(
+            ctx,
+            directory,
+            branch = branch,
+            commit = commit,
+            remote = remote,
+            shallow_since = ctx.attr.shallow_since,
+            tag = ctx.attr.tag,
+            init_submodules = ctx.attr.init_submodules,
+            verbose = ctx.attr.verbose,
+            strip_prefix = ctx.attr.strip_prefix,
+            recursive_init_submodules = ctx.attr.recursive_init_submodules,
+        )
         workspace_and_buildfile(ctx)
         ctx.delete(ctx.path(".git"))
 
@@ -680,6 +728,11 @@ nixpkgs_git_repository = repository_rule(
     attrs = {
         "commit": attr.string(),
         "remote": attr.string(),
+        "fetchGitFile": attr.label(
+            allow_single_file = True,
+            doc = "file contraining a nix struct of the form " +
+                  "{url = \"...\"; rev = \"...\"; ref = \"...\"}",
+        ),
         "shallow_since": attr.string(
             default = "",
             doc =
@@ -726,6 +779,16 @@ nixpkgs_git_repository = repository_rule(
                 "The content for the WORKSPACE file for this repository. " +
                 "Either `workspace_file` or `workspace_file_content` can be " +
                 "specified, or neither, but not both.",
+        ),
+        "tag": attr.string(
+            default = "",
+            doc =
+                "tag in the remote repository to checked out." +
+                " Precisely one of branch, tag, or commit must be specified.",
+        ),
+        "strip_prefix": attr.string(
+            default = "",
+            doc = "A directory prefix to strip from the extracted files.",
         ),
     },
 )
