@@ -818,7 +818,6 @@ def nixpkgs_cc_configure(
     attribute_paths = [
         "pkgs.clang",
         "pkgs.gcc.cc",
-        "pkgs.gcc.cc.lib",
         "pkgs.binutils.bintools",
     ]
 
