@@ -91,7 +91,7 @@ def read_nix_package_root(repository_ctx):
 
     return [
         nix_package_root + "/" + attribute_path
-        for attribute_path in attr.attribute_paths
+        for attribute_path in repository_ctx.attr.attribute_paths
     ]
 
 def _is_supported_platform(repository_ctx):
