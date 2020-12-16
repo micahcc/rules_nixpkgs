@@ -1,5 +1,7 @@
 """Rules for importing Nixpkgs packages."""
 
+load("@bazel_tools//tools/build_defs/repo:git_worker.bzl", "git_repo")
+load("@bazel_tools//tools/build_defs/repo:utils.bzl", "workspace_and_buildfile")
 load("@bazel_skylib//lib:sets.bzl", "sets")
 load("@bazel_skylib//lib:versions.bzl", "versions")
 load("@bazel_tools//tools/cpp:cc_configure.bzl", "cc_autoconf_impl")
@@ -12,15 +14,30 @@ load(
 load("@bazel_tools//tools/build_defs/repo:utils.bzl", "maybe")
 load(":private/location_expansion.bzl", "expand_location")
 
+NIX_FLAGS = [
+    "NIX_LDFLAGS",
+    "NIX_CFLAGS_COMPILE",
+    "NIX_CC",
+]
+
+def inside_nix(repository_ctx):
+    for key in NIX_FLAGS:
+        if key not in repository_ctx.os.environ:
+            return False
+    return True
+
 def _get_include_dirs(repository_ctx, compiler):
-    result = _execute_or_fail(repository_ctx, [
-        compiler,
-        "-E",
-        "-x",
-        "c++",
-        "-",
-        "-v",
-    ], failure_message = "Failed to get builtin includes")
+    result = _execute_or_fail(
+        repository_ctx,
+        [
+            compiler,
+            "-E",
+            "-x",
+            "c++",
+            "-",
+            "-v",
+        ],
+    )
 
     gatheringInc = False
     gatheringSys = False
@@ -78,7 +95,7 @@ def filter_empty(lst):
             out.append(f)
     return out
 
-def read_nix_package_root(repository_ctx):
+def _read_nix_package_root(repository_ctx):
     ldflags = repository_ctx.os.environ.get("NIX_LDFLAGS")
     cc = repository_ctx.os.environ.get("NIX_CC")
     cflags = repository_ctx.os.environ.get("NIX_CFLAGS_COMPILE")
@@ -90,7 +107,7 @@ def read_nix_package_root(repository_ctx):
         fail("If you are building inside nixpkgs, you must have a package that contains symlinks to all the dependencies in this build")
 
     return [
-        nix_package_root + "/" + attribute_path
+        repository_ctx.path(nix_package_root + "/" + attribute_path).realpath
         for attribute_path in repository_ctx.attr.attribute_paths
     ]
 
@@ -126,7 +143,7 @@ def _build_nixpkg(repository_ctx):
     else:
         expr_args = ["-E", "import <nixpkgs>"]
 
-    for _, attribute_path in repository_ctx.attr.attribute_paths.items():
+    for attribute_path in repository_ctx.attr.attribute_paths:
         expr_args.extend([
             "-A",
             attribute_path,
@@ -234,8 +251,6 @@ def _match_inputs_to_attributes(buildInputs, attr_map):
     return outputs
 
 def _nixpkgs_package_impl(repository_ctx):
-    nix_prepackaged_outputs = read_nix_package_root(repository_ctx)
-
     # If true, a BUILD file will be created from a template if it does not
     # exits.
     # However this will happen AFTER the nix-build command.
@@ -250,9 +265,9 @@ def _nixpkgs_package_impl(repository_ctx):
         # No user supplied build file, we may create the default one.
         create_build_file_if_needed = True
 
-    if nix_prepackaged_outputs != None:
-        # we're inside nix, remap
-        output_paths = nix_prepackaged_outputs
+    if inside_nix(repository_ctx):
+        # we're inside nix, use the provided NIX_PACKAGE_ROOT
+        output_paths = _read_nix_package_root(repository_ctx)
     else:
         # we're outside nix so we should be able to build the packages directly
         output_paths = _build_nixpkg(repository_ctx)
@@ -282,7 +297,8 @@ def _nixpkgs_package_impl(repository_ctx):
 
 _nixpkgs_package = repository_rule(
     implementation = _nixpkgs_package_impl,
-    environ = ["buildInputs", "nativeBuildInputs", "propagatedBuildInputs"],
+    environ = ["NIX_PACKAGE_ROOT"] + NIX_FLAGS,
+    configure = True,
     attrs = {
         "attribute_paths": attr.string_list(),  # name of packages to build e.g. pkgs.boost
         "repositories": attr.label_keyed_string_dict(),
@@ -611,6 +627,8 @@ def _nixpkgs_cc_toolchain_config_impl(repository_ctx):
 
 _nixpkgs_cc_toolchain_config = repository_rule(
     _nixpkgs_cc_toolchain_config_impl,
+    environ = ["NIX_PACKAGE_ROOT"] + NIX_FLAGS,
+    configure = True,
     attrs = {
         "fail_not_supported": attr.bool(),
         "ar": attr.label(mandatory = True),
@@ -641,6 +659,73 @@ _nixpkgs_cc_toolchain_config = repository_rule(
         ),
         "_build": attr.label(
             default = Label("@bazel_tools//tools/cpp:BUILD.tpl"),
+        ),
+    },
+)
+
+def _nixpkgs_git_repository_impl(ctx):
+    if inside_nix(ctx):
+        ctx.file("BUILD", executable = False)
+        ctx.file("WORKSPACE", executable = False)
+    else:
+        root = ctx.path(".")
+        directory = str(root)
+        git_repo(ctx, directory)
+        workspace_and_buildfile(ctx)
+        ctx.delete(ctx.path(".git"))
+
+nixpkgs_git_repository = repository_rule(
+    _nixpkgs_git_repository_impl,
+    environ = ["NIX_PACKAGE_ROOT"] + NIX_FLAGS,
+    attrs = {
+        "commit": attr.string(),
+        "remote": attr.string(),
+        "shallow_since": attr.string(
+            default = "",
+            doc =
+                "an optional date, not after the specified commit; the " +
+                "argument is not allowed if a tag is specified (which allows " +
+                "cloning with depth 1). Setting such a date close to the " +
+                "specified commit allows for a more shallow clone of the " +
+                "repository, saving bandwidth " +
+                "and wall-clock time.",
+        ),
+        "verbose": attr.bool(default = False),
+        "init_submodules": attr.bool(
+            default = False,
+            doc = "Whether to clone submodules in the repository.",
+        ),
+        "recursive_init_submodules": attr.bool(
+            default = False,
+            doc = "Whether to clone submodules recursively in the repository.",
+        ),
+        "build_file": attr.label(
+            allow_single_file = True,
+            doc =
+                "The file to use as the BUILD file for this repository." +
+                "This attribute is an absolute label (use '@//' for the main " +
+                "repo). The file does not need to be named BUILD, but can " +
+                "be (something like BUILD.new-repo-name may work well for " +
+                "distinguishing it from the repository's actual BUILD files. " +
+                "Either build_file or build_file_content must be specified.",
+        ),
+        "build_file_content": attr.string(
+            default = 'filegroup(name = "srcs", srcs = glob(["**"]), visibility = ["//visibility:public"])',
+            doc =
+                "The content for the BUILD file for this repository. " +
+                "Either build_file or build_file_content must be specified.",
+        ),
+        "workspace_file": attr.label(
+            doc =
+                "The file to use as the `WORKSPACE` file for this repository. " +
+                "Either `workspace_file` or `workspace_file_content` can be " +
+                "specified, or neither, but not both.",
+        ),
+        "workspace_file_content": attr.string(
+            doc =
+                "The content for the WORKSPACE file for this repository. " +
+                "Either `workspace_file` or `workspace_file_content` can be " +
+                "specified, or neither, but not both.",
         ),
     },
 )
@@ -738,7 +823,7 @@ def nixpkgs_cc_configure(
     ]
 
     # Invoke `toolchains/cc.nix` which generates `CC_TOOLCHAIN_INFO`.
-    nixpkgs_package(
+    _nixpkgs_package(
         name = "{}_pkg".format(name),
         build_file = "@io_tweag_rules_nixpkgs//nixpkgs/toolchains:cc.BUILD",
         repositories = repositories,
@@ -810,119 +895,6 @@ def nixpkgs_cc_autoconf_impl(repository_ctx):
         for tool in [entry.rpartition("/")[-1]]  # Compute basename
     }
     cc_autoconf_impl(repository_ctx, overriden_tools = overriden_tools)
-
-nixpkgs_cc_autoconf = repository_rule(
-    implementation = nixpkgs_cc_autoconf_impl,
-    # Copied from
-    # https://github.com/bazelbuild/bazel/blob/master/tools/cpp/cc_configure.bzl.
-    # Keep in sync.
-    environ = [
-        "ABI_LIBC_VERSION",
-        "ABI_VERSION",
-        "BAZEL_COMPILER",
-        "BAZEL_HOST_SYSTEM",
-        "BAZEL_LINKOPTS",
-        "BAZEL_PYTHON",
-        "BAZEL_SH",
-        "BAZEL_TARGET_CPU",
-        "BAZEL_TARGET_LIBC",
-        "BAZEL_TARGET_SYSTEM",
-        "BAZEL_USE_CPP_ONLY_TOOLCHAIN",
-        "BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN",
-        "BAZEL_USE_LLVM_NATIVE_COVERAGE",
-        "BAZEL_VC",
-        "BAZEL_VS",
-        "BAZEL_LLVM",
-        "USE_CLANG_CL",
-        "CC",
-        "CC_CONFIGURE_DEBUG",
-        "CC_TOOLCHAIN_NAME",
-        "CPLUS_INCLUDE_PATH",
-        "GCOV",
-        "HOMEBREW_RUBY_PATH",
-        "SYSTEMROOT",
-        "VS90COMNTOOLS",
-        "VS100COMNTOOLS",
-        "VS110COMNTOOLS",
-        "VS120COMNTOOLS",
-        "VS140COMNTOOLS",
-    ],
-)
-
-def nixpkgs_cc_configure_deprecated(
-        repository = None,
-        repositories = {},
-        nix_file = None,
-        nix_file_deps = None,
-        nix_file_content = None,
-        nixopts = []):
-    """Use a CC toolchain from Nixpkgs. No-op if not a nix-based platform.
-
-    Tells Bazel to use compilers and linkers from Nixpkgs for the CC toolchain.
-    By default, Bazel auto-configures a CC toolchain from commands available in
-    the environment (e.g. `gcc`). Overriding this autodetection makes builds
-    more hermetic and is considered a best practice.
-
-    #### Example
-
-      ```bzl
-      nixpkgs_cc_configure(repository = "@nixpkgs//:default.nix")
-      ```
-
-    Args:
-      repository: A repository label identifying which Nixpkgs to use.
-        Equivalent to `repositories = { "nixpkgs": ...}`.
-      repositories: A dictionary mapping `NIX_PATH` entries to repository labels.
-
-        Setting it to
-        ```
-        repositories = { "myrepo" : "//:myrepo" }
-        ```
-        for example would replace all instances of `<myrepo>` in the called nix code by the path to the target `"//:myrepo"`. See the [relevant section in the nix manual](https://nixos.org/nix/manual/#env-NIX_PATH) for more information.
-
-        Specify one of `repository` or `repositories`.
-      nix_file: An expression for a Nix environment derivation.
-        The environment should expose all the commands that make up a CC
-        toolchain (`cc`, `ld` etc). Exposes all commands in `stdenv.cc` and
-        `binutils` by default.
-      nix_file_deps: Dependencies of `nix_file` if any.
-      nix_file_content: An expression for a Nix environment derivation.
-      nixopts: Options to forward to the nix command.
-
-    Deprecated:
-      Use `nixpkgs_cc_configure` instead.
-
-      While this improves upon Bazel's autoconfigure toolchain by picking tools
-      from a Nix derivation rather than the environment, it is still not fully
-      hermetic as it is affected by the environment. In particular, system
-      include directories specified in the environment can leak in and affect
-      the cache keys of targets depending on the cc toolchain leading to cache
-      misses.
-    """
-    if not nix_file and not nix_file_content:
-        nix_file_content = """
-          with import <nixpkgs>; buildEnv {
-            name = "bazel-cc-toolchain";
-            paths = [  ];
-          }
-        """
-    nixpkgs_package(
-        name = "nixpkgs_cc_toolchain",
-        repository = repository,
-        repositories = repositories,
-        attribute_paths = [
-            "stdenv.cc",
-            "binutils",
-        ],
-        build_file_content = """exports_files(glob(["bin/*"]))""",
-        nixopts = nixopts,
-    )
-
-    # Following lines should match
-    # https://github.com/bazelbuild/bazel/blob/master/tools/cpp/cc_configure.bzl#L93.
-    nixpkgs_cc_autoconf(name = "local_config_cc")
-    native.bind(name = "cc_toolchain", actual = "@local_config_cc//:toolchain")
-    native.register_toolchains("@local_config_cc//:all")
 
 def _nixpkgs_python_toolchain_impl(repository_ctx):
     cpu = get_cpu_value(repository_ctx)
