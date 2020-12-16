@@ -20,7 +20,7 @@ NIX_FLAGS = [
     "NIX_CC",
 ]
 
-def inside_nix(repository_ctx):
+def _inside_nix(repository_ctx):
     for key in NIX_FLAGS:
         if key not in repository_ctx.os.environ:
             return False
@@ -265,7 +265,7 @@ def _nixpkgs_package_impl(repository_ctx):
         # No user supplied build file, we may create the default one.
         create_build_file_if_needed = True
 
-    if inside_nix(repository_ctx):
+    if _inside_nix(repository_ctx):
         # we're inside nix, use the provided NIX_PACKAGE_ROOT
         output_paths = _read_nix_package_root(repository_ctx)
     else:
@@ -664,7 +664,7 @@ _nixpkgs_cc_toolchain_config = repository_rule(
 )
 
 def _nixpkgs_git_repository_impl(ctx):
-    if inside_nix(ctx):
+    if _inside_nix(ctx):
         ctx.file("BUILD", executable = False)
         ctx.file("WORKSPACE", executable = False)
     else:
