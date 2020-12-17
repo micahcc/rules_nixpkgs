@@ -14,18 +14,6 @@ load("@bazel_tools//tools/build_defs/repo:utils.bzl", "maybe")
 load(":private/location_expansion.bzl", "expand_location")
 load("//nixpkgs:git.bzl", "git_repo")
 
-NIX_FLAGS = [
-    "NIX_LDFLAGS",
-    "NIX_CFLAGS_COMPILE",
-    "NIX_CC",
-]
-
-def _inside_nix(repository_ctx):
-    for key in NIX_FLAGS:
-        if key not in repository_ctx.os.environ:
-            return False
-    return True
-
 def _get_include_dirs(repository_ctx, compiler):
     result = _execute_or_fail(
         repository_ctx,
@@ -96,13 +84,7 @@ def filter_empty(lst):
     return out
 
 def _read_nix_package_root(repository_ctx):
-    ldflags = repository_ctx.os.environ.get("NIX_LDFLAGS")
-    cc = repository_ctx.os.environ.get("NIX_CC")
-    cflags = repository_ctx.os.environ.get("NIX_CFLAGS_COMPILE")
     nix_package_root = repository_ctx.os.environ.get("NIX_PACKAGE_ROOT")
-    if ldflags == None and cc == None and cflags == None:
-        return None
-
     if nix_package_root == None:
         fail("If you are building inside nixpkgs, you must have a package that contains symlinks to all the dependencies in this build")
 
@@ -265,7 +247,7 @@ def _nixpkgs_package_impl(repository_ctx):
         # No user supplied build file, we may create the default one.
         create_build_file_if_needed = True
 
-    if _inside_nix(repository_ctx):
+    if "NIX_PACKAGE_ROOT" in repository_ctx.os.environ:
         # we're inside nix, use the provided NIX_PACKAGE_ROOT
         output_paths = _read_nix_package_root(repository_ctx)
     else:
@@ -297,7 +279,7 @@ def _nixpkgs_package_impl(repository_ctx):
 
 _nixpkgs_package = repository_rule(
     implementation = _nixpkgs_package_impl,
-    environ = ["NIX_PACKAGE_ROOT"] + NIX_FLAGS,
+    environ = ["NIX_PACKAGE_ROOT"],
     configure = True,
     attrs = {
         "attribute_paths": attr.string_list(),  # name of packages to build e.g. pkgs.boost
@@ -627,7 +609,7 @@ def _nixpkgs_cc_toolchain_config_impl(repository_ctx):
 
 _nixpkgs_cc_toolchain_config = repository_rule(
     _nixpkgs_cc_toolchain_config_impl,
-    environ = ["NIX_PACKAGE_ROOT"] + NIX_FLAGS,
+    environ = ["NIX_PACKAGE_ROOT"],
     configure = True,
     attrs = {
         "fail_not_supported": attr.bool(),
@@ -690,7 +672,7 @@ def _loadNixStructFile(ctx, fname):
     return remapped
 
 def _nixpkgs_git_repository_impl(ctx):
-    if _inside_nix(ctx):
+    if "NIX_PACKAGE_ROOT" in ctx.os.environ:
         ctx.file("BUILD", executable = False)
         ctx.file("WORKSPACE", executable = False)
     else:
@@ -724,7 +706,7 @@ def _nixpkgs_git_repository_impl(ctx):
 
 nixpkgs_git_repository = repository_rule(
     _nixpkgs_git_repository_impl,
-    environ = ["NIX_PACKAGE_ROOT"] + NIX_FLAGS,
+    environ = ["NIX_PACKAGE_ROOT"],
     attrs = {
         "commit": attr.string(),
         "remote": attr.string(),
